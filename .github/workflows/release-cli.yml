@@ -1,0 +1,83 @@
+name: Release CLI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    # Pull requests that cannot change the release executable skip this workflow.
+    # It is not a required check, so skipping never blocks a merge. Pushes to main
+    # are unfiltered: every main commit gets the full release-profile verification.
+    paths:
+      - src-tauri/**
+      - scripts/**
+      - package.json
+      - package-lock.json
+      - .github/workflows/release-cli.yml
+      - .github/actions/**
+
+permissions:
+  contents: read
+
+# Newer pushes replace older PR runs; every main commit keeps its own uncancelled run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release-cli:
+    name: ${{ matrix.platform }} release CLI
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # Type-checking is done once by the Build workflow; only the bundle is needed here.
+      - uses: ./.github/actions/frontend-bg
+        with:
+          phase: start
+      - uses: ./.github/actions/linux-deps
+        if: runner.os == 'Linux'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: release-cli-${{ matrix.platform }}
+          cache-bin: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/frontend-bg
+        with:
+          phase: wait
+      - name: Build actual release executable
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+      - name: Test release CLI with captured stdout and stderr
+        shell: bash
+        run: |
+          BINARY=src-tauri/target/release/agy-switch-desktop
+          if [[ "$RUNNER_OS" == Windows ]]; then BINARY="${BINARY}.exe"; fi
+          node scripts/test-cli.mjs "$BINARY"
+      - name: Test interactive CLI in a real terminal
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          BINARY=src-tauri/target/release/agy-switch
+          if [[ "$RUNNER_OS" == Windows ]]; then BINARY="$BINARY.exe"; fi
+          node scripts/test-cli-terminal.mjs "$BINARY"
+          node scripts/test-cli-account-window.mjs "$BINARY"
+
+      - name: Test dedicated Windows console CLI in PowerShell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-cli.ps1 -Binary ./src-tauri/target/release/agy-switch.exe -Console
+      - name: Test Windows release CLI with explicit PowerShell waiting
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-cli.ps1 -Binary ./src-tauri/target/release/agy-switch-desktop.exe
